@@ -24,8 +24,9 @@ class Crawler():
 	output 	= None
 	report 	= False
 
-	config 	= None
-	domain	= ""
+	config 	 = None
+	domain	 = ""
+	endpoint = ""
 
 	exclude = []
 	include = []
@@ -61,7 +62,7 @@ class Crawler():
 
 	def __init__(self, parserobots=False, output=None, report=False ,domain="",
 				 exclude=[], skipext=[], include=[], drop=[], debug=False,
-				 verbose=False, images=False, redis=False):
+				 verbose=False, images=False, redis=False, endpoint=''):
 		self.parserobots = parserobots
 		self.output 	= output
 		self.report 	= report
@@ -74,10 +75,12 @@ class Crawler():
 		self.verbose    = verbose
 		self.images     = images
 		self.redis      = bool(redis)
+		self.endpoint   = endpoint
 
 		if self.redis:
 			self.redis_server = red.StrictRedis(host='localhost', port=6379, db=0)
 
+		self.print_exclude = ['search/go?']
 
 		# added hardcoded exclude words
 		excluded_words = ['blog', 'archive']
@@ -129,11 +132,17 @@ class Crawler():
 	def __crawling(self):
 		crawling = self.tocrawl.pop()
 
-		# added to reduce the number of repeat urls
 		url = urlparse(crawling)
-		self.crawled.add('https' + '://' + url.netloc + url.path)
-		self.crawled.add('http' + '://' + url.netloc + url.path)
 
+		# added to reduce the number of repeat urls
+		crawled_url = crawling.lower()
+		self.crawled.add(crawled_url)
+		if url.scheme == 'https':
+			self.crawled.add(crawled_url.replace('https', 'http'))
+		elif url.scheme == 'http':
+			self.crawled.add(crawled_url.replace('http', 'https'))
+
+		url = urlparse(crawling)
 		logging.info("Crawling #{}: {}".format(len(self.crawled), url.geturl()))
 		request = Request(crawling, headers={"User-Agent":config.crawler_user_agent})
 
@@ -234,20 +243,21 @@ class Crawler():
 
 		cleaned_url = url.geturl()
 
-		print ("<url><loc>" + cleaned_url + "</loc>" + lastmod + image_list + "</url>", file=self.output_file)
-		if self.output_file:
-			self.output_file.flush()
-
-		if self.redis:
-			random_digits = "".join([ hexdigits[random.randint(0,0xF)] for _ in range(12) ])
-			entry = { "class": 'MyWorker',
-			        "queue": 'default',
-			        "args": [msg],
-			        'retry': False,
-			        'jid': random_digits,
-			        'created_at': time.time(),
-			        'enqueued_at': time.time() }
-			self.redis_server.lpush("queue:default", json.dumps(entry))
+		# if self.url_included(cleaned_url):
+		# print ("<url><loc>" + cleaned_url + "</loc>" + lastmod + image_list + "</url>", file=self.output_file)
+		# if self.output_file:
+		# 	self.output_file.flush()
+		#
+		# if self.redis:
+		# 	random_digits = "".join([ hexdigits[random.randint(0,0xF)] for _ in range(12) ])
+		# 	entry = { "class": 'MyWorker',
+		# 	        "queue": 'default',
+		# 	        "args": [msg],
+		# 	        'retry': False,
+		# 	        'jid': random_digits,
+		# 	        'created_at': time.time(),
+		# 	        'enqueued_at': time.time() }
+		# 	self.redis_server.lpush("queue:default", json.dumps(entry))
 
 		# Found links
 		links = self.linkregex.findall(msg)
@@ -257,7 +267,9 @@ class Crawler():
 			link = self.clean_link(link)#.lower()
 			logging.debug("Found : {0}".format(link))
 
-			if link.startswith('/'):
+			if link.startswith("//"):
+				link = url.scheme + ":" + link
+			elif link.startswith('/'):
 				link = url.scheme + '://' + url[1] + link
 			elif link.startswith('#'):
 				link = url.scheme + '://' + url[1] + url[2] + link
@@ -279,15 +291,20 @@ class Crawler():
 			domain_link = parsed_link.netloc
 			target_extension = os.path.splitext(parsed_link.path)[1][1:]
 
-			if link in self.crawled:
+			if domain_link != self.target_domain:
+				if domain_link == self.target_domain.replace('www.', ''):
+					ind = link.index(domain_link)
+					link = link[:ind] + 'www.' + link[ind+4:]
+				else:
+					continue
+
+			if link.lower in self.crawled:
 				continue
 			if link in self.tocrawl:
 				continue
 			if link in self.excluded:
 				continue
 
-			if domain_link != self.target_domain:
-				continue
 			if parsed_link.path in ["", "/"]:
 				continue
 			if "javascript" in link:
@@ -325,9 +342,25 @@ class Crawler():
 				self.nb_exclude+=1
 				continue
 
+			if self.endpoint != '' and self.endpoint in link:
+				self.exclude_link(link)
+				self.nb_exclude+=1
+				for ex in self.print_exclude:
+					if ex not in link:
+						print ("<url><loc>" + link + "</loc></url>", file=self.output_file)
+						if self.output_file:
+							self.output_file.flush()
+						continue
+
 			self.tocrawl.add(link)
 
 		return None
+
+	def url_included(self, url):
+		for inc in self.included:
+			if inc in url:
+				return True
+		return False
 
 	def clean_link(self, link):
 		l = urlparse(link)
@@ -375,9 +408,6 @@ class Crawler():
 	def exclude_url(self, link):
 		for ex in self.exclude:
 			if ex in link:
-				return False
-		for inc in self.include:
-			if inc not in link:
 				return False
 		return True
 

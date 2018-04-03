@@ -19,6 +19,7 @@ parser.add_argument('--report', action="store_true", default=False, required=Fal
 parser.add_argument('--images', action="store_true", default=False, required=False, help="Add image to sitemap.xml (see https://support.google.com/webmasters/answer/178636?hl=en)")
 parser.add_argument('--include', action="append", default=[], required=False, help="Included words")
 parser.add_argument('--redis', action="store_true", default=False, required=False, help="Send site data to a redis server")
+parser.add_argument('--endpoint', action="store", default='', required=False, help="sites to report but not crawl")
 
 
 group = parser.add_mutually_exclusive_group()
