@@ -1,3 +1,5 @@
+import pdb # pdb.set_trace()
+
 import config
 import logging
 from urllib.parse import urljoin, urlunparse
@@ -7,6 +9,10 @@ from urllib.parse import urlparse
 from urllib.request import urlopen, Request
 from urllib.robotparser import RobotFileParser
 from datetime import datetime
+
+import redis as red
+import random
+import json
 
 import mimetypes
 import os
@@ -22,6 +28,7 @@ class Crawler():
 	domain	= ""
 
 	exclude = []
+	include = []
 	skipext = []
 	drop    = []
 
@@ -30,10 +37,12 @@ class Crawler():
 	tocrawl = set([])
 	crawled = set([])
 	excluded = set([])
+	included = set([])
 
 	marked = {}
 
-	not_parseable_ressources = (".epub", ".mobi", ".docx", ".doc", ".opf", ".7z", ".ibooks", ".cbr", ".avi", ".mkv", ".mp4", ".jpg", ".jpeg", ".png", ".gif" ,".pdf", ".iso", ".rar", ".tar", ".tgz", ".zip", ".dmg", ".exe")
+	not_parseable_ressources = (".rdf", ".epub", ".mobi", ".docx", ".doc", ".opf", ".7z", ".ibooks", ".cbr", ".avi", ".mkv", ".mp4", ".jpg", ".jpeg", ".png", ".gif" ,".pdf", ".iso", ".rar", ".tar", ".tgz", ".zip", ".dmg", ".exe")
+	hexdigits = "0123456789ABCDEF"
 
 	# TODO also search for window.location={.*?}
 	linkregex = re.compile(b'<a [^>]*href=[\'|"](.*?)[\'"][^>]*?>')
@@ -51,17 +60,29 @@ class Crawler():
 	scheme		  = ""
 
 	def __init__(self, parserobots=False, output=None, report=False ,domain="",
-				 exclude=[], skipext=[], drop=[], debug=False, verbose=False, images=False):
+				 exclude=[], skipext=[], include=[], drop=[], debug=False,
+				 verbose=False, images=False, redis=False):
 		self.parserobots = parserobots
 		self.output 	= output
 		self.report 	= report
 		self.domain 	= domain
 		self.exclude 	= exclude
+		self.include 	= include
 		self.skipext 	= skipext
 		self.drop		= drop
 		self.debug		= debug
 		self.verbose    = verbose
 		self.images     = images
+		self.redis      = bool(redis)
+
+		if self.redis:
+			self.redis_server = red.StrictRedis(host='localhost', port=6379, db=0)
+
+
+		# added hardcoded exclude words
+		excluded_words = ['blog', 'archive']
+		for word in excluded_words:
+			exclude.append(word)
 
 		if self.debug:
 			log_level = logging.DEBUG
@@ -84,7 +105,7 @@ class Crawler():
 
 		if self.output:
 			try:
-				self.output_file = open(self.output, 'w')
+				self.output_file = open('sitemaps/' + self.output, 'w')
 			except:
 				logging.error ("Output file not available.")
 				exit(255)
@@ -108,8 +129,11 @@ class Crawler():
 	def __crawling(self):
 		crawling = self.tocrawl.pop()
 
+		# added to reduce the number of repeat urls
 		url = urlparse(crawling)
-		self.crawled.add(crawling)
+		self.crawled.add('https' + '://' + url.netloc + url.path)
+		self.crawled.add('http' + '://' + url.netloc + url.path)
+
 		logging.info("Crawling #{}: {}".format(len(self.crawled), url.geturl()))
 		request = Request(crawling, headers={"User-Agent":config.crawler_user_agent})
 
@@ -201,22 +225,36 @@ class Crawler():
 				# robot file
 				if self.can_fetch(image_link):
 					logging.debug("Found image : {0}".format(image_link))
-					image_list = "{0}<image:image><image:loc>{1}</image:loc></image:image>".format(image_list, self.htmlspecialchars(image_link))
+					image_list = "{0}<image:image><image:loc>{1}</image:loc></image:image>".format(image_list, image_link)
 
 		# Last mod fetched ?
 		lastmod = ""
 		if date:
 			lastmod = "<lastmod>"+date.strftime('%Y-%m-%dT%H:%M:%S+00:00')+"</lastmod>"
 
-		print ("<url><loc>"+self.htmlspecialchars(url.geturl())+"</loc>" + lastmod + image_list + "</url>", file=self.output_file)
+		cleaned_url = url.geturl()
+
+		print ("<url><loc>" + cleaned_url + "</loc>" + lastmod + image_list + "</url>", file=self.output_file)
 		if self.output_file:
 			self.output_file.flush()
+
+		if self.redis:
+			random_digits = "".join([ hexdigits[random.randint(0,0xF)] for _ in range(12) ])
+			entry = { "class": 'MyWorker',
+			        "queue": 'default',
+			        "args": [msg],
+			        'retry': False,
+			        'jid': random_digits,
+			        'created_at': time.time(),
+			        'enqueued_at': time.time() }
+			self.redis_server.lpush("queue:default", json.dumps(entry))
 
 		# Found links
 		links = self.linkregex.findall(msg)
 		for link in links:
 			link = link.decode("utf-8", errors="ignore")
-			link = self.clean_link(link)
+			# added .lower() to avoid case-insensitivity duplicates
+			link = self.clean_link(link)#.lower()
 			logging.debug("Found : {0}".format(link))
 
 			if link.startswith('/'):
@@ -225,7 +263,7 @@ class Crawler():
 				link = url.scheme + '://' + url[1] + url[2] + link
 			elif link.startswith(("mailto", "tel")):
 				continue
-			elif not link.startswith(('http', "https")):
+			elif not link.startswith(('http')):
 				link = url.scheme + '://' + url[1] + '/' + link
 
 			# Remove the anchor part if needed
@@ -247,6 +285,7 @@ class Crawler():
 				continue
 			if link in self.excluded:
 				continue
+
 			if domain_link != self.target_domain:
 				continue
 			if parsed_link.path in ["", "/"]:
@@ -260,6 +299,13 @@ class Crawler():
 
 			# Count one more URL
 			self.nb_url+=1
+
+
+			# Check if the navigation is request by user
+			# if not self.include_link(link):
+			# 	self.exclude_link(link)
+			# 	self.nb_exclude+=1
+			# 	continue
 
 			# Check if the navigation is allowed by the robots.txt
 			if not self.can_fetch(link):
@@ -329,6 +375,9 @@ class Crawler():
 	def exclude_url(self, link):
 		for ex in self.exclude:
 			if ex in link:
+				return False
+		for inc in self.include:
+			if inc not in link:
 				return False
 		return True
 
